@@ -1,0 +1,17 @@
+# Arquivos de log e cache do Python
+logs/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Configurações de IDE (PyCharm)
+.idea/
+
+# Diretórios de Dados e Output (CRUCIAL para seu projeto Airflow/ML)
+# Ajuste estes caminhos se eles não estiverem na raiz
+data/
+data/ml/
+data/ml/input/
+data/ml/output/
+data/ml/training/
+*.log
