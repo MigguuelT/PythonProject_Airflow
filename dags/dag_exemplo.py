@@ -38,3 +38,5 @@ with DAG(
     )
 
     gera_arquivo >> processa_arquivo
+
+    # dag.test()
