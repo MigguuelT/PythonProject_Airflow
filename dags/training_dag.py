@@ -3,6 +3,7 @@ import sys
 from datetime import datetime
 from airflow import DAG
 import json
+import shutil
 
 from airflow.providers.sqlite.hooks.sqlite import SqliteHook
 from airflow.sdk.definitions.decorators import task
@@ -20,6 +21,8 @@ ML_DIR = os.path.join(DATA_DIR, 'ml')
 INPUT_DIR = os.path.join(ML_DIR, 'input')
 OUTPUT_DIR = os.path.join(ML_DIR, 'output')
 TRAINING_DIR = os.path.join(ML_DIR, 'training')
+HISTORY_DIR = os.path.join(ML_DIR, 'history')
+PRODUCTION_DIR = os.path.join(ML_DIR, 'production')
 # ID de conexão do banco de dados no Airflow UI para salvar as métricas
 DB_CONN_ID = "sqlite_metrics_db"
 
@@ -30,6 +33,8 @@ def ensure_local_data_exists():
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(TRAINING_DIR, exist_ok=True)
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+    os.makedirs(PRODUCTION_DIR, exist_ok=True)
     print("Diretórios de trabalho locais garantidos.")
 
 
@@ -71,10 +76,10 @@ def save_metrics(metrics: dict):
         return None
 
     file_name = metrics["model_name"].replace(" ", "_").replace("-", "")
-    output_path = os.path.join(OUTPUT_DIR, f'metrics_{file_name}.json')
+    output_path = os.path.join(HISTORY_DIR, f'metrics_{file_name}.json')
 
     # Garante que o diretório exista antes de escrever
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(HISTORY_DIR, exist_ok=True)
 
     metrics_json = json.dumps(metrics, indent=4)
 
@@ -128,8 +133,95 @@ def log_metrics_to_db(metrics: dict, **context):
     hook.run(sql_insert, parameters=data_to_insert)
     print(f"Métricas salvas com sucesso no SQLite para o run_id: {run_id}")
 
-    # Remove a tarefa antiga de salvar em JSON para evitar duplicidade
-    # return f"SQLite: {run_id}"
+
+@task.branch(task_id='compare_last_metric')
+def compare_last_metric():
+    """
+    Compara a acurácia do modelo recém-treinado com o modelo anterior para decidir
+    se deve fazer o deploy ou pular.
+    """
+    hook = SqliteHook(sqlite_conn_id=DB_CONN_ID)
+
+    # Busca as duas execuções mais recentes ordenadas por timestamp
+    sql_query = """
+                SELECT accuracy
+                FROM model_metrics
+                ORDER BY run_timestamp DESC LIMIT 2; \
+                """
+
+    # O hook retorna uma lista de tuplas: [(acurácia_recente,), (acurácia_antiga,)]
+    data = hook.get_records(sql=sql_query)
+
+    # Verifica se há dados suficientes para comparação
+    if len(data) < 2:
+        print("Aviso: Menos de 2 modelos no histórico. Promovendo por precaução.")
+        # Se for o primeiro treino, ou se não houver comparação, geralmente promove-se
+        return "deploy_new_model"
+
+    # Extrai a acurácia (está na posição [0] de cada tupla)
+    acuracia_nova = data[0][0]  # Primeiro registro (mais recente), primeiro campo (accuracy)
+    acuracia_antiga = data[1][0]  # Segundo registro (anterior), primeiro campo (accuracy)
+
+    print(f"Acurácia Atual: {acuracia_nova:.4f}")
+    print(f"Acurácia Anterior: {acuracia_antiga:.4f}")
+
+    # Lógica de Decisão: Acurácia nova deve ser MAIOR que a antiga
+    if acuracia_nova > acuracia_antiga:
+        print("Decisão: PROMOVER. Acurácia nova é superior.")
+        return "deploy_new_model"  # Retorna o task_id do deploy
+    else:
+        print("Decisão: REJEITAR. Acurácia não melhorou ou é igual.")
+        return "skip_deployment"  # Retorna o task_id para pular o deploy
+
+
+@task(task_id='deploy_new_model')
+def deploy_model(metrics_dict: dict):  # Recebe o dicionário de métricas do XCom
+    """Lógica de deploy: move o modelo treinado para produção."""
+    # 🛑 1. VERIFICAÇÃO CRÍTICA DE SAFETY CHECK 🛑
+    if metrics_dict is None:
+        print("Deploy Pulado: A tarefa de treinamento não produziu métricas válidas.")
+        # Se você quer garantir que o fluxo vá para o cleanup, você pode retornar sem exceção.
+        return None
+
+    # 1. Obtém o nome dinâmico que foi usado para salvar o arquivo
+    dynamic_model_name = metrics_dict.get('model_name')
+
+    # 2. Constrói o nome do arquivo PKL COMPLETO
+    model_filename = f'{dynamic_model_name}.pkl'
+
+    # 3. Define os caminhos
+    # ORIGEM: Onde o modelo foi salvo pela task 'training_model'
+    source_path = os.path.join(OUTPUT_DIR, model_filename)
+    # DESTINO: Onde a DAG de Inferência irá procurar (nome fixo)
+    dest_path = os.path.join(PRODUCTION_DIR, 'model.pkl')
+
+    # Garante que o diretório de produção exista
+    os.makedirs(PRODUCTION_DIR, exist_ok=True)
+
+    # 4. Verificar e MOVER o arquivo
+    if os.path.exists(source_path):
+        # Remove qualquer modelo antigo (model.pkl) na pasta de produção
+        if os.path.exists(dest_path):
+            os.unlink(dest_path)
+
+            # Move o arquivo dinâmico (RandomForest-...) para o nome fixo (model.pkl)
+        shutil.move(source_path, dest_path)
+        print(f"NOVO MODELO ({model_filename}) PROMOVIDO para {dest_path}.")
+    else:
+        # Se falhar, mostra o caminho exato que falhou (para debugging futuro)
+        print(f"ERRO: Arquivo fonte não encontrado em: {source_path}")
+        raise FileNotFoundError(f"Arquivo do modelo não encontrado em: {source_path}")
+
+
+@task(task_id='skip_deployment')
+def skip_deploy(metrics_dict: dict):
+    """Lógica de pular: o modelo antigo permanece em produção."""
+    # 🛑 1. VERIFICAÇÃO CRÍTICA DE SAFETY CHECK 🛑
+    if metrics_dict is None:
+        print("Deploy Pulado: A tarefa de treinamento não produziu métricas válidas.")
+        # Se você quer garantir que o fluxo vá para o cleanup, você pode retornar sem exceção.
+        return None
+    print("MODELO REJEITADO. MANTER MODELO ATUAL EM PRODUÇÃO.")
 
 
 @task(trigger_rule='all_done')
@@ -143,6 +235,7 @@ def cleanup():
         print(f"Arquivos temporários de treinamento em ({TRAINING_DIR}) limpos.")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(HISTORY_DIR, exist_ok=True)
     print("Limpeza concluída. Modelo treinado foi PRESERVADO em OUTPUT_DIR.")
 
 
@@ -159,19 +252,36 @@ with DAG(
     data_path = load_data()
 
     # 3. Training/Evaluation
-    metrics = training_model(data_path)  # Retorna um dicionário
+    metrics = training_model(data_path)
 
-    # 4. Save Metrics (JSON - MANTIDO como backup, mas opcional)
+    # 4. Save Metrics (JSON e DB)
     save_log_json = save_metrics(metrics)
+    save_log_db = log_metrics_to_db(metrics)  # Esta deve rodar antes da decisão
 
-    # 5. Save Metrics to DB (NOVO!)
-    save_log_db = log_metrics_to_db(metrics)
+    # 5. Decisão de Retreino e Ramificação
+    decisao = compare_last_metric()
 
-    # 6. Cleanup
+    # 6. Crie as instâncias das tarefas de deploy e skip **
+    deploy_task_instance = deploy_model(metrics)
+    skip_task_instance = skip_deploy(metrics)
+
+    # 7. Cleanup
     cleanup_task = cleanup()
 
-    # --- FLUXO DE EXECUÇÃO ATUALIZADO ---
+    # --- FLUXO DE EXECUÇÃO CORRIGIDO ---
+
+    # 1. Setup e Treino
     setup >> data_path >> metrics
 
-    # Após o treino, as ações de log (JSON e DB) podem rodar em paralelo
-    metrics >> [save_log_json, save_log_db] >> cleanup_task
+    # 2. Após o treino, salve os logs em paralelo
+    metrics >> [save_log_json, save_log_db]
+
+    # 3. A DECISÃO deve esperar o LOG NO BANCO DE DADOS terminar.
+    save_log_db >> decisao
+
+    # 4. Ramificação (Deploy ou Skip)
+    decisao >> [deploy_task_instance, skip_task_instance]
+
+    # 5. Finalização
+    # cleanup_task só roda DEPOIS do deploy ou do skip.
+    [deploy_task_instance, skip_task_instance] >> cleanup_task

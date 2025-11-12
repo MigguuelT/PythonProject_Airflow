@@ -38,7 +38,7 @@ def train_model(train_data, model_path):
         os.makedirs(model_path)
 
     # Salva o modelo
-    pickle.dump(model, open(os.path.join(model_path, 'model.pkl'), 'wb'))
+    pickle.dump(model, open(os.path.join(model_path, f'{model_name}.pkl'), 'wb'))
 
     # Retorna o dicionário COMPLETO de métricas para a DAG
     return {

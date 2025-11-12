@@ -18,6 +18,8 @@ ML_DIR = os.path.join(DATA_DIR, 'ml')
 INPUT_DIR = os.path.join(ML_DIR, 'input')
 OUTPUT_DIR = os.path.join(ML_DIR, 'output')
 TRAINING_DIR = os.path.join(ML_DIR, 'training')
+HISTORY_DIR = os.path.join(ML_DIR, 'history')
+PRODUCTION_DIR = os.path.join(ML_DIR, 'production')
 
 
 # --- FUNÇÕES DAS TASKS ---
@@ -27,6 +29,8 @@ def ensure_local_data_exists():
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(TRAINING_DIR, exist_ok=True)
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+    os.makedirs(PRODUCTION_DIR, exist_ok=True)
     print("Diretórios de trabalho locais garantidos.")
 
 
@@ -47,14 +51,14 @@ def load_data():
 
 @task
 def load_model_task():
-    model_name = 'model.pkl'
-    model_path = os.path.join(OUTPUT_DIR, model_name)
+    model_name_in_prod = 'model.pkl' # Nome fixo
+    model_path = os.path.join(PRODUCTION_DIR, model_name_in_prod)
 
     if not os.path.exists(model_path):
-        print(f"ERRO: Arquivo do modelo não encontrado - {model_path}. O treinamento precisa ser executado!")
-        raise FileNotFoundError(f"Modelo {model_name} não encontrado. Execute a DAG de treinamento primeiro.")
+        print(f"ERRO: Modelo de produção '{model_name_in_prod}' não encontrado.")
+        raise FileNotFoundError("Nenhum modelo em produção. Execute a DAG de treinamento com sucesso.")
     else:
-        print(f"Modelo PKL encontrado: {model_path}")
+        print(f"Modelo PKL de produção carregado: {model_path}")
         # Retorna o caminho ABSOLUTO para a próxima task
         return model_path
 
@@ -68,7 +72,7 @@ def run_inference_model(test_data_path, model_path):
     model = load_model(model_path)
 
     # 3. Executa a predição e salva
-    output_path = OUTPUT_DIR
+    output_path = HISTORY_DIR
 
     # O seu módulo inference_model.py contém a função 'predict'
     predict(model, test_data, output_path)
@@ -91,6 +95,7 @@ def cleanup():
 
     # Garante que o diretório OUTPUT (onde está o modelo) existe, mas não o limpa.
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(HISTORY_DIR, exist_ok=True)
     print("Limpeza concluída. Modelo e predições (no OUTPUT_DIR) PRESERVADOS.")
 
 

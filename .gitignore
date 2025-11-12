@@ -15,3 +15,6 @@ data/ml/input/
 data/ml/output/
 data/ml/training/
 *.log
+
+# Arquivo de senha do sistema
+simple_auth_manager_passwords.json.generated
